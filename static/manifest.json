@@ -1,0 +1,16 @@
+{
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "name": "Forkcast",
+  "short_name": "Forkcast",
+  "description": "Plan meals, count calories and build the shopping list.",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "theme_color": "#d6553a",
+  "background_color": "#faf6f0",
+  "display": "standalone"
+}

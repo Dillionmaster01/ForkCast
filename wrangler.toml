@@ -1,0 +1,17 @@
+name = "forkcast"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Food lookups use USDA FoodData Central. Without a key the shared DEMO_KEY is used,
+# which is heavily rate limited. A free key: https://fdc.nal.usda.gov/api-key-signup
+#   npx wrangler secret put USDA_API_KEY
+
+[assets]
+directory = "./static"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "forkcast-db"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"

@@ -1,0 +1,22 @@
+{
+  "name": "forkcast",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --port 8791",
+    "deploy": "wrangler deploy",
+    "db:migrate:local": "wrangler d1 migrations apply forkcast-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply forkcast-db --remote",
+    "test": "node --test tests/shared.test.mjs tests/import.test.mjs",
+    "test:api": "node tests/api.scenario.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.0.0",
+    "typescript": "^5.6.0",
+    "wrangler": "^4.0.0"
+  },
+  "dependencies": {
+    "hono": "^4.6.0"
+  }
+}
