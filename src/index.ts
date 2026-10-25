@@ -188,7 +188,7 @@ async function seedFoods(env: Env) {
 // ───────────────────────── recipes ─────────────────────────
 type RecipeOut = ReturnType<typeof computeRecipe>;
 
-function computeRecipe(r: any, ings: any[], foods: Map<string, Food>) {
+function computeRecipe(r: any, ings: any[], foods: Map<string, Food>, sides: any[] = []) {
   let total: Nut = { ...ZERO };
   let cost = 0;
   let costLines = 0;
@@ -223,6 +223,7 @@ function computeRecipe(r: any, ings: any[], foods: Map<string, Food>) {
     id: r.id, name: r.name, servings, description: r.description, steps, source_url: r.source_url, image_url: r.image_url,
     prep_min: r.prep_min, cook_min: r.cook_min, tags: r.tags ? String(r.tags).split(",").map((t: string) => t.trim()).filter(Boolean) : [],
     notes: r.notes, site_kcal: r.site_kcal, favorite: !!r.favorite, archived: !!r.archived, created_at: r.created_at, updated_at: r.updated_at,
+    is_side: !!r.is_side, sides,
     ingredients: lines,
     total: roundNut(total),
     perServing: roundNut({ kcal: total.kcal / servings, protein: total.protein / servings, carbs: total.carbs / servings, fat: total.fat / servings }),
@@ -247,10 +248,25 @@ async function recipeBundle(env: Env, foods: Map<string, Food>, ids: string[] | 
     if (!byRecipe.has(i.recipe_id)) byRecipe.set(i.recipe_id, []);
     byRecipe.get(i.recipe_id)!.push(i);
   }
-  return new Map(rows.map((r) => [r.id, computeRecipe(r, byRecipe.get(r.id) || [], foods)]));
+  const sideRows = await selectIn(env, "SELECT * FROM recipe_sides WHERE recipe_id IN ({IN}) ORDER BY position", rows.map((r) => r.id));
+  const sideRecipes = new Map((await selectIn(env, "SELECT id, name, archived FROM recipes WHERE id IN ({IN})", sideRows.map((x) => x.side_recipe_id)))
+    .map((x: any) => [x.id, x]));
+  const sidesBy = new Map<string, any[]>();
+  for (const x of sideRows) {
+    const sr: any = x.side_recipe_id ? sideRecipes.get(x.side_recipe_id) : null;
+    const sf = x.side_food_id ? foods.get(x.side_food_id) : null;
+    if ((!sr && !sf) || (sr && sr.archived)) continue;
+    const n = sf ? nutritionFor(sf, x.qty ?? 1, x.unit || (sf.basis === "each" ? "each" : "serving")) : null;
+    if (!sidesBy.has(x.recipe_id)) sidesBy.set(x.recipe_id, []);
+    sidesBy.get(x.recipe_id)!.push({
+      kind: sr ? "recipe" : "food", recipe_id: sr ? sr.id : null, food_id: sf ? sf.id : null,
+      name: sr ? sr.name : sf!.name, qty: x.qty, unit: x.unit, kcal: n ? Math.round(n.kcal) : null,
+    });
+  }
+  return new Map(rows.map((r) => [r.id, computeRecipe(r, byRecipe.get(r.id) || [], foods, sidesBy.get(r.id) || [])]));
 }
 
-function recipeInput(b: any): { row?: Record<string, unknown>; ingredients?: any[]; error?: string } {
+function recipeInput(b: any): { row?: Record<string, unknown>; ingredients?: any[]; sides?: any[]; error?: string } {
   const name = str(b.name, 150);
   if (!name) return { error: "Give the recipe a name." };
   const servings = num(b.servings, { min: 0.25, max: 200, nullable: false });
@@ -279,12 +295,22 @@ function recipeInput(b: any): { row?: Record<string, unknown>; ingredients?: any
   const mins = (v: unknown) => num(v, { min: 0, max: 10000 }) ?? null;
   const url = str(b.source_url, 1000);
   const img = str(b.image_url, 1000);
+  // suggested sides: undefined = leave them as they are
+  const sides = b.sides === undefined ? undefined : (Array.isArray(b.sides) ? b.sides : []).slice(0, 12)
+    .map((x: any) => ({
+      recipe_id: x && typeof x.recipe_id === "string" ? x.recipe_id : null,
+      food_id: x && typeof x.food_id === "string" ? x.food_id : null,
+      qty: num(x?.qty, { min: 0.001, max: 10000 }) ?? null,
+      unit: normUnit(x?.unit) || null,
+    }))
+    .filter((x: any) => x.recipe_id || x.food_id);
   return {
+    sides,
     row: {
       name, servings, description: str(b.description, 2000) || null, steps: JSON.stringify(steps),
       source_url: /^https?:\/\//i.test(url) ? url : null, image_url: /^https?:\/\//i.test(img) ? img : null,
       prep_min: mins(b.prep_min), cook_min: mins(b.cook_min), tags: tags || null, notes: str(b.notes, 4000) || null,
-      site_kcal: num(b.site_kcal, { min: 0, max: 20000 }) ?? null, favorite: b.favorite ? 1 : 0,
+      site_kcal: num(b.site_kcal, { min: 0, max: 20000 }) ?? null, favorite: b.favorite ? 1 : 0, is_side: b.is_side ? 1 : 0,
     },
     ingredients,
   };
@@ -302,6 +328,23 @@ async function writeIngredients(env: Env, recipeId: string, ingredients: any[], 
        VALUES (?,?,?,?,?,?,?,?,?,?,?)`
     ).bind(newId(), recipeId, pos, i.text, i.qty, i.unit, i.name, i.note, foodId, i.grams, i.optional ? 1 : 0));
   });
+  await env.DB.batch(stmts);
+}
+
+async function writeSides(env: Env, recipeId: string, sides: any[]) {
+  const rIds = sides.map((x) => x.recipe_id).filter((id) => id && id !== recipeId);
+  const fIds = sides.map((x) => x.food_id).filter(Boolean);
+  const okR = new Set((await selectIn(env, "SELECT id FROM recipes WHERE id IN ({IN})", rIds)).map((x: any) => x.id));
+  const okF = new Set((await selectIn(env, "SELECT id FROM foods WHERE id IN ({IN})", fIds)).map((x: any) => x.id));
+  const stmts: D1PreparedStatement[] = [env.DB.prepare("DELETE FROM recipe_sides WHERE recipe_id = ?").bind(recipeId)];
+  let pos = 0;
+  for (const x of sides) {
+    const rid = x.recipe_id && okR.has(x.recipe_id) ? x.recipe_id : null;
+    const fid = !rid && x.food_id && okF.has(x.food_id) ? x.food_id : null;
+    if (!rid && !fid) continue;
+    stmts.push(env.DB.prepare("INSERT INTO recipe_sides (id, recipe_id, position, side_recipe_id, side_food_id, qty, unit) VALUES (?,?,?,?,?,?,?)")
+      .bind(newId(), recipeId, pos++, rid, fid, fid ? x.qty ?? 1 : null, fid ? x.unit : null));
+  }
   await env.DB.batch(stmts);
 }
 
@@ -353,7 +396,7 @@ async function planRange(env: Env, from: string, to: string) {
     const r = i.kind === "recipe" ? recipes.get(i.recipe_id) : null;
     const f = i.kind === "food" ? foods.get(i.food_id) : null;
     return {
-      id: i.id, date: i.date, slot: i.slot, position: i.position, kind: i.kind, recipe_id: i.recipe_id, food_id: i.food_id,
+      id: i.id, date: i.date, slot: i.slot, position: i.position, kind: i.kind, recipe_id: i.recipe_id, food_id: i.food_id, parent_id: i.parent_id,
       qty: i.qty, unit: i.unit, batch: i.batch, note: i.note, cooked: !!i.cooked,
       kcal: i.kcal, protein: i.protein, carbs: i.carbs, fat: i.fat,
       title: i.title || r?.name || (f ? f.name : "Meal"),
@@ -818,6 +861,7 @@ app.get("/api/recipes", async (c) => {
     id: r.id, name: r.name, servings: r.servings, image_url: r.image_url, tags: r.tags, favorite: r.favorite,
     perServing: r.perServing, costPerServing: r.costPerServing, prep_min: r.prep_min, cook_min: r.cook_min,
     unmatched: r.unmatched + r.unconverted, ingredientCount: r.ingredients.length, updated_at: r.updated_at,
+    is_side: r.is_side, sides: r.sides,
   })));
 });
 
@@ -829,7 +873,7 @@ app.get("/api/recipes/:id", async (c) => {
 });
 
 app.post("/api/recipes", async (c) => {
-  const { row, ingredients, error } = recipeInput(await body(c));
+  const { row, ingredients, sides, error } = recipeInput(await body(c));
   if (error) return bad(c, error);
   const id = newId();
   const ts = nowIso();
@@ -838,6 +882,7 @@ app.post("/api/recipes", async (c) => {
   await c.env.DB.prepare(`INSERT INTO recipes (${keys.join(",")}) VALUES (${keys.map(() => "?").join(",")})`).bind(...keys.map((k) => (full as any)[k])).run();
   const foods = await allFoods(c.env);
   await writeIngredients(c.env, id, ingredients!, foods);
+  if (sides) await writeSides(c.env, id, sides);
   return c.json((await recipeBundle(c.env, foods, [id])).get(id));
 });
 
@@ -850,12 +895,13 @@ app.put("/api/recipes/:id", async (c) => {
   if (Object.keys(b).length === 1 && b.favorite !== undefined) {
     await c.env.DB.prepare("UPDATE recipes SET favorite = ? WHERE id = ?").bind(b.favorite ? 1 : 0, id).run();
   } else {
-    const { row, ingredients, error } = recipeInput(b);
+    const { row, ingredients, sides, error } = recipeInput(b);
     if (error) return bad(c, error);
     const full: Record<string, unknown> = { ...row!, updated_at: nowIso() };
     const keys = Object.keys(full);
     await c.env.DB.prepare(`UPDATE recipes SET ${keys.map((k) => `${k} = ?`).join(", ")} WHERE id = ?`).bind(...keys.map((k) => full[k]), id).run();
     await writeIngredients(c.env, id, ingredients!, await allFoods(c.env));
+    if (sides) await writeSides(c.env, id, sides);
   }
   const foods = await allFoods(c.env);
   return c.json((await recipeBundle(c.env, foods, [id])).get(id));
@@ -929,46 +975,71 @@ async function eatersInput(env: Env, raw: unknown, fallbackUser: string) {
   return out;
 }
 
-app.post("/api/plan", async (c) => {
-  const b = await body(c);
-  if (!isDate(b.date)) return bad(c, "Pick a day.");
-  if (!SLOTS.includes(b.slot)) return bad(c, "Pick breakfast, lunch, dinner, dessert or snack.");
+async function createPlanItem(env: Env, userId: string, b: any): Promise<{ id?: string; error?: string }> {
+  if (b.parent_id) {
+    const parent = await env.DB.prepare("SELECT id, date, slot FROM plan_items WHERE id = ? AND parent_id IS NULL").bind(b.parent_id).first<any>();
+    if (!parent) return { error: "That meal doesn't exist." };
+    b = { ...b, date: parent.date, slot: parent.slot };
+  }
+  if (!isDate(b.date)) return { error: "Pick a day." };
+  if (!SLOTS.includes(b.slot)) return { error: "Pick breakfast, lunch, dinner, dessert or snack." };
   const kind = ["recipe", "food", "quick"].includes(b.kind) ? b.kind : null;
-  if (!kind) return bad(c, "Unknown meal type.");
-  const row: Record<string, unknown> = { id: newId(), date: b.date, slot: b.slot, kind, created_by: c.get("user").id, created_at: nowIso() };
+  if (!kind) return { error: "Unknown meal type." };
+  const row: Record<string, unknown> = { id: newId(), date: b.date, slot: b.slot, kind, parent_id: b.parent_id || null, created_by: userId, created_at: nowIso() };
   if (kind === "recipe") {
-    const r = await c.env.DB.prepare("SELECT id, name FROM recipes WHERE id = ?").bind(b.recipe_id).first<any>();
-    if (!r) return bad(c, "That recipe doesn't exist.");
+    const r = await env.DB.prepare("SELECT id, name FROM recipes WHERE id = ?").bind(b.recipe_id).first<any>();
+    if (!r) return { error: "That recipe doesn't exist." };
     row.recipe_id = r.id;
     row.batch = num(b.batch, { min: 0, max: 20, nullable: false }) ?? 1;
   } else if (kind === "food") {
-    const f = await c.env.DB.prepare("SELECT id, basis FROM foods WHERE id = ?").bind(b.food_id).first<any>();
-    if (!f) return bad(c, "That food doesn't exist.");
+    const f = await env.DB.prepare("SELECT id, basis FROM foods WHERE id = ?").bind(b.food_id).first<any>();
+    if (!f) return { error: "That food doesn't exist." };
     row.food_id = f.id;
     row.qty = num(b.qty, { min: 0.001, max: 100000, nullable: false }) ?? 1;
     row.unit = normUnit(b.unit) || (f.basis === "each" ? "each" : "serving");
     row.batch = b.batch === 0 ? 0 : 1;
   } else {
     const title = str(b.title, 120);
-    if (!title) return bad(c, "Give it a name.");
+    if (!title) return { error: "Give it a name." };
     row.title = title;
     for (const k of ["kcal", "protein", "carbs", "fat"]) row[k] = num(b[k], { min: 0, max: 20000 }) ?? null;
-    if (row.kcal == null) return bad(c, "Enter the calories.");
+    if (row.kcal == null) return { error: "Enter the calories." };
     row.batch = 0;
   }
   if (kind !== "quick" && b.title) row.title = str(b.title, 120) || null;
   row.note = str(b.note, 300) || null;
-  const last = await c.env.DB.prepare("SELECT MAX(position) p FROM plan_items WHERE date = ? AND slot = ?").bind(b.date, b.slot).first<{ p: number | null }>();
+  const last = await env.DB.prepare("SELECT MAX(position) p FROM plan_items WHERE date = ? AND slot = ?").bind(b.date, b.slot).first<{ p: number | null }>();
   row.position = (last?.p ?? 0) + 1;
-  const eaters = await eatersInput(c.env, b.eaters, c.get("user").id);
+  const eaters = await eatersInput(env, b.eaters, userId);
   const keys = Object.keys(row);
-  const stmts = [c.env.DB.prepare(`INSERT INTO plan_items (${keys.join(",")}) VALUES (${keys.map(() => "?").join(",")})`).bind(...keys.map((k) => row[k] ?? null))];
+  const stmts = [env.DB.prepare(`INSERT INTO plan_items (${keys.join(",")}) VALUES (${keys.map(() => "?").join(",")})`).bind(...keys.map((k) => row[k] ?? null))];
   for (const e of eaters) {
-    stmts.push(c.env.DB.prepare("INSERT INTO plan_eaters (plan_item_id, user_id, servings, status, updated_at) VALUES (?,?,?,?,?)")
+    stmts.push(env.DB.prepare("INSERT INTO plan_eaters (plan_item_id, user_id, servings, status, updated_at) VALUES (?,?,?,?,?)")
       .bind(row.id, e.user_id, e.servings, e.status, nowIso()));
   }
-  await c.env.DB.batch(stmts);
-  return c.json({ id: row.id });
+  await env.DB.batch(stmts);
+  return { id: row.id as string };
+}
+
+app.post("/api/plan", async (c) => {
+  const b = await body(c);
+  const userId = c.get("user").id;
+  const main = await createPlanItem(c.env, userId, b);
+  if (main.error) return bad(c, main.error);
+  // sides chosen with the meal: each is its own item (own calories, own shopping), hung off the main
+  const sides: string[] = [];
+  if (Array.isArray(b.sides) && !b.parent_id) {
+    const eaters = Array.isArray(b.eaters) ? b.eaters.map((e: any) => ({ user_id: e?.user_id, status: e?.status, servings: 1 })) : undefined;
+    for (const sd of b.sides.slice(0, 12)) {
+      if (!sd || typeof sd !== "object") continue;
+      const r = await createPlanItem(c.env, userId, {
+        kind: sd.kind === "food" ? "food" : "recipe", recipe_id: sd.recipe_id, food_id: sd.food_id, qty: sd.qty, unit: sd.unit,
+        batch: sd.batch ?? 1, parent_id: main.id, eaters,
+      });
+      if (r.id) sides.push(r.id);
+    }
+  }
+  return c.json({ id: main.id, sides });
 });
 
 app.put("/api/plan/:id", async (c) => {
@@ -995,6 +1066,10 @@ app.put("/api/plan/:id", async (c) => {
   const stmts: D1PreparedStatement[] = [];
   const keys = Object.keys(row);
   if (keys.length) stmts.push(c.env.DB.prepare(`UPDATE plan_items SET ${keys.map((k) => `${k} = ?`).join(", ")} WHERE id = ?`).bind(...keys.map((k) => row[k]), id));
+  // a meal's sides move with it
+  if (row.date || row.slot) {
+    stmts.push(c.env.DB.prepare("UPDATE plan_items SET date = ?, slot = ? WHERE parent_id = ?").bind(row.date ?? item.date, row.slot ?? item.slot, id));
+  }
   if (b.eaters !== undefined) {
     const eaters = await eatersInput(c.env, b.eaters, c.get("user").id);
     stmts.push(c.env.DB.prepare("DELETE FROM plan_eaters WHERE plan_item_id = ?").bind(id));
@@ -1017,7 +1092,10 @@ app.put("/api/plan/:id/eaters/:uid", async (c) => {
   const b = await body(c);
   const cur = await c.env.DB.prepare("SELECT * FROM plan_eaters WHERE plan_item_id = ? AND user_id = ?").bind(id, uid).first<any>();
   if (b.remove) {
-    await c.env.DB.prepare("DELETE FROM plan_eaters WHERE plan_item_id = ? AND user_id = ?").bind(id, uid).run();
+    await c.env.DB.batch([
+      c.env.DB.prepare("DELETE FROM plan_eaters WHERE plan_item_id = ? AND user_id = ?").bind(id, uid),
+      c.env.DB.prepare("DELETE FROM plan_eaters WHERE user_id = ? AND plan_item_id IN (SELECT id FROM plan_items WHERE parent_id = ?)").bind(uid, id),
+    ]);
     return c.json({ ok: true });
   }
   const status = b.status !== undefined ? (STATUSES.includes(b.status) ? b.status : null) : cur?.status || "planned";
@@ -1028,6 +1106,11 @@ app.put("/api/plan/:id/eaters/:uid", async (c) => {
     `INSERT INTO plan_eaters (plan_item_id, user_id, servings, status, updated_at) VALUES (?,?,?,?,?)
      ON CONFLICT (plan_item_id, user_id) DO UPDATE SET servings = excluded.servings, status = excluded.status, updated_at = excluded.updated_at`
   ).bind(id, uid, servings, status, nowIso()).run();
+  // ate / skipped the main meal: the same goes for its sides
+  if (b.status !== undefined) {
+    await c.env.DB.prepare("UPDATE plan_eaters SET status = ?, updated_at = ? WHERE user_id = ? AND plan_item_id IN (SELECT id FROM plan_items WHERE parent_id = ?)")
+      .bind(status, nowIso(), uid, id).run();
+  }
   // eaten a recipe that hasn't been cooked yet: say how much of it the pantry can give up
   let pantryLines = 0;
   if (status === "eaten" && item.kind === "recipe" && !item.cooked) pantryLines = (await cookPlan(c.env, item, true)).length;
@@ -1035,7 +1118,7 @@ app.put("/api/plan/:id/eaters/:uid", async (c) => {
 });
 
 app.delete("/api/plan/:id", async (c) => {
-  await c.env.DB.prepare("DELETE FROM plan_items WHERE id = ?").bind(c.req.param("id")).run();
+  await c.env.DB.prepare("DELETE FROM plan_items WHERE id = ? OR parent_id = ?").bind(c.req.param("id"), c.req.param("id")).run();
   return c.json({ ok: true });
 });
 
@@ -1044,13 +1127,16 @@ async function copyItems(env: Env, items: any[], shiftDays: number | null, targe
   const eaters = await selectIn(env, "SELECT * FROM plan_eaters WHERE plan_item_id IN ({IN})", ids);
   const stmts: D1PreparedStatement[] = [];
   const ts = nowIso();
+  // a copied main keeps its copied sides; a side copied on its own stands alone
+  const newIds = new Map(items.map((i) => [i.id, newId()]));
   for (const i of items) {
-    const nid = newId();
+    const nid = newIds.get(i.id)!;
     const date = target.date ?? addDays(i.date, shiftDays || 0);
     stmts.push(env.DB.prepare(
-      `INSERT INTO plan_items (id, date, slot, position, kind, recipe_id, food_id, qty, unit, title, kcal, protein, carbs, fat, batch, note, cooked, created_by, created_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)`
-    ).bind(nid, date, target.slot ?? i.slot, i.position + 1000, i.kind, i.recipe_id, i.food_id, i.qty, i.unit, i.title, i.kcal, i.protein, i.carbs, i.fat, i.batch, i.note, userId, ts));
+      `INSERT INTO plan_items (id, date, slot, position, kind, recipe_id, food_id, qty, unit, title, kcal, protein, carbs, fat, batch, note, cooked, parent_id, created_by, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)`
+    ).bind(nid, date, target.slot ?? i.slot, i.position + 1000, i.kind, i.recipe_id, i.food_id, i.qty, i.unit, i.title, i.kcal, i.protein, i.carbs, i.fat, i.batch, i.note,
+      i.parent_id ? newIds.get(i.parent_id) ?? null : null, userId, ts));
     for (const e of eaters.filter((e) => e.plan_item_id === i.id)) {
       stmts.push(env.DB.prepare("INSERT INTO plan_eaters (plan_item_id, user_id, servings, status, updated_at) VALUES (?,?,?,'planned',?)")
         .bind(nid, e.user_id, e.servings, ts));
@@ -1066,7 +1152,8 @@ app.post("/api/plan/:id/duplicate", async (c) => {
   const b = await body(c);
   if (!isDate(b.date)) return bad(c, "Pick a day.");
   const slot = SLOTS.includes(b.slot) ? b.slot : item.slot;
-  await copyItems(c.env, [item], null, { date: b.date, slot }, c.get("user").id);
+  const { results: kids } = await c.env.DB.prepare("SELECT * FROM plan_items WHERE parent_id = ?").bind(item.id).all();
+  await copyItems(c.env, [item, ...(kids as any[])], null, { date: b.date, slot }, c.get("user").id);
   return c.json({ ok: true });
 });
 

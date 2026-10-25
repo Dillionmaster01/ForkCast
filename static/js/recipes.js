@@ -4,7 +4,7 @@ import { S, api, esc, h, $, $$, openSheet, confirmSheet, toast, fail, icon, fmtK
 import { parseIngredient, matchFood } from '../shared/ingredients.js';
 import { nutritionFor, fmtAmount, addNut, ZERO } from '../shared/units.js';
 import { openFoodPicker } from './foods.js';
-import { openAddSheet } from './plan.js';
+import { openAddSheet, openSidePicker } from './plan.js';
 
 let filterTag = 'all';
 let search = '';
@@ -28,16 +28,17 @@ export async function renderRecipes(mount) {
     <input class="input" id="rq" placeholder="Search recipes or tags" value="${esc(search)}" style="margin-bottom:10px">
     <div class="chips" style="margin-bottom:14px"><button class="chip ${filterTag === 'all' ? 'on' : ''}" data-tag="all">All</button>
       <button class="chip ${filterTag === 'fav' ? 'on' : ''}" data-tag="fav">★ Favorites</button>
+      <button class="chip ${filterTag === 'side' ? 'on' : ''}" data-tag="side">Sides</button>
       ${tags.map((t) => `<button class="chip ${filterTag === t ? 'on' : ''}" data-tag="${esc(t)}">${esc(t)}</button>`).join('')}</div>
     <div id="grid"></div>`;
   const draw = () => {
     const q = search.toLowerCase();
-    const shown = list.filter((r) => (filterTag === 'all' || (filterTag === 'fav' ? r.favorite : r.tags.includes(filterTag))) && (!q || r.name.toLowerCase().includes(q) || r.tags.some((t) => t.toLowerCase().includes(q))))
+    const shown = list.filter((r) => (filterTag === 'all' || (filterTag === 'fav' ? r.favorite : filterTag === 'side' ? r.is_side : r.tags.includes(filterTag))) && (!q || r.name.toLowerCase().includes(q) || r.tags.some((t) => t.toLowerCase().includes(q))))
       .sort((a, b) => Number(b.favorite) - Number(a.favorite) || a.name.localeCompare(b.name));
     $('#grid', mount).innerHTML = shown.length ? `<div class="rgrid">${shown.map((r) => `<div class="rcard" data-id="${esc(r.id)}">
         <div class="img ${r.image_url ? '' : phClass(r.name)}" ${r.image_url ? `style="background-image:url('${esc(r.image_url)}')"` : ''}>${r.image_url ? '' : recipeEmoji(r.name, r.tags)}${r.favorite ? '<span class="fav">★</span>' : ''}</div>
         <div class="body"><div class="name">${esc(r.name)}</div>
-        <div class="meta"><span class="num"><b>${fmtK(r.perServing.kcal)}</b> kcal</span>${r.costPerServing != null ? `<span>${fmtMoney(r.costPerServing)}/serv</span>` : ''}${mins(r) ? `<span>${mins(r)}</span>` : ''}${r.unmatched ? '<span style="color:var(--amber)">● check</span>' : ''}</div></div></div>`).join('')}</div>`
+        <div class="meta"><span class="num"><b>${fmtK(r.perServing.kcal)}</b> kcal</span>${r.costPerServing != null ? `<span>${fmtMoney(r.costPerServing)}/serv</span>` : ''}${mins(r) ? `<span>${mins(r)}</span>` : ''}${r.is_side ? '<span class="badge">side</span>' : ''}${r.unmatched ? '<span style="color:var(--amber)">● check</span>' : ''}</div></div></div>`).join('')}</div>`
       : `<div class="empty"><div class="art">📖</div><h3>${list.length ? 'Nothing matches' : 'Your cookbook is empty'}</h3><p>${list.length ? 'Try another search.' : 'Add a recipe you make, or import one from any recipe site.'}</p>
         ${list.length ? '' : '<div class="row" style="justify-content:center"><button class="btn" data-import2>Import from a link</button><button class="btn primary" data-new2>New recipe</button></div>'}</div>`;
     $$('.rcard', mount).forEach((c) => (c.onclick = () => go(`recipe/${c.dataset.id}`)));
@@ -55,6 +56,7 @@ function recipeBody(r, ingredients) {
   return {
     name: r.name, servings: r.servings, description: r.description, steps: r.steps, source_url: r.source_url, image_url: r.image_url,
     prep_min: r.prep_min, cook_min: r.cook_min, tags: r.tags, notes: r.notes, site_kcal: r.site_kcal, favorite: r.favorite,
+    is_side: r.is_side,
     ingredients: ingredients.map((i) => ({ text: i.text, qty: i.qty, unit: i.unit, name: i.name, note: i.note, grams: i.grams, optional: i.optional, food_id: i.food_id || null })),
   };
 }
@@ -70,7 +72,7 @@ export async function renderRecipe(mount, id) {
   mount.innerHTML = `<a href="#recipes" class="link small" style="display:inline-flex;align-items:center;gap:4px;margin-bottom:10px">${icon('left', 'width="16" height="16"')}Recipes</a>
     <div class="recipe-hero">
       <div class="img ${r.image_url ? '' : `noimg ${phClass(r.name)}`}" ${r.image_url ? `style="background-image:url('${esc(r.image_url)}')"` : ''}>${r.image_url ? '' : recipeEmoji(r.name, r.tags)}</div>
-      <div><div class="row wrap">${r.tags.map((t) => `<span class="badge">${esc(t)}</span>`).join('')}</div>
+      <div><div class="row wrap">${r.is_side ? '<span class="badge accent">Side dish</span>' : ''}${r.tags.map((t) => `<span class="badge">${esc(t)}</span>`).join('')}</div>
         <h1>${esc(r.name)}</h1>
         ${r.description ? `<p class="muted" style="margin:0 0 8px">${esc(r.description)}</p>` : ''}
         <div class="stats">
@@ -84,6 +86,8 @@ export async function renderRecipe(mount, id) {
           ${r.prep_min ? `<span>Prep ${r.prep_min} min</span>` : ''}${r.cook_min ? `<span>Cook ${r.cook_min} min</span>` : ''}
           ${r.site_kcal ? `<span title="What the recipe's website says">Site says ${fmtK(r.site_kcal)} kcal</span>` : ''}
         </div>
+        ${r.sides.length ? `<div class="row wrap small" style="margin-top:10px;gap:6px"><span class="muted">Goes well with</span>${r.sides.map((x) => x.kind === 'recipe'
+          ? `<a class="chip" href="#recipe/${esc(x.recipe_id)}">${esc(x.name)}</a>` : `<span class="chip">${esc(x.name)}</span>`).join('')}</div>` : ''}
         ${r.unmatched + r.unconverted ? `<div class="note" style="margin-top:10px;border-left:3px solid var(--amber)"><b>${r.unmatched + r.unconverted} ingredient${r.unmatched + r.unconverted === 1 ? '' : 's'}</b> aren't counted in the calories yet - tap the orange ones below to match them.</div>` : ''}
         <div class="row wrap" style="margin-top:14px">
           <button class="btn primary" data-plan>${icon('plan')}Add to plan</button>
@@ -151,6 +155,8 @@ export function openRecipeEditor(recipe, { draft = false } = {}) {
       <div class="field"><span>Ingredients - one per line, the way a recipe writes them</span><div class="ing-edit" id="rows"></div>
         <div class="row wrap" style="margin-top:6px"><button type="button" class="btn sm" id="addrow">${icon('plus')}Ingredient</button><button type="button" class="btn sm ghost" id="paste">Paste a list</button>
         <span class="spacer"></span><span class="small" id="tot"></span></div></div>
+      <label class="row small" style="margin:-2px 0 12px"><input type="checkbox" name="is_side" ${r.is_side ? 'checked' : ''}> This is a side dish (shows up when picking sides)</label>
+      <div class="field" id="sidesField"><span>Suggested sides - offered when you plan this recipe</span><div class="row wrap" id="sideChips" style="gap:6px"></div></div>
       <label class="field"><span>Steps - one per line</span><textarea class="input" name="steps" rows="6">${esc((r.steps || []).join('\n'))}</textarea></label>
       <details ${r.description || r.notes || r.image_url || r.source_url ? 'open' : ''}><summary class="small muted" style="cursor:pointer;margin-bottom:10px">Photo, link, notes</summary>
         <label class="field"><span>Short description</span><input class="input" name="description" value="${esc(r.description || '')}"></label>
@@ -161,6 +167,17 @@ export function openRecipeEditor(recipe, { draft = false } = {}) {
     foot: `<button class="btn" data-cancel>Cancel</button><button class="btn primary" data-save>${isNew ? 'Save recipe' : 'Save'}</button>`,
   });
   const box = $('#rows', sh.el);
+  let sides = (r.sides || []).map((x) => ({ ...x }));
+  const drawSides = () => {
+    const chips = $('#sideChips', sh.el);
+    chips.innerHTML = sides.map((x, i) => `<span class="chip">${esc(x.name)}<button type="button" class="link" data-rs="${i}" aria-label="Remove" style="color:var(--muted)">✕</button></span>`).join('')
+      + '<button type="button" class="btn sm" data-as>+ Add a side</button>';
+    $$('[data-rs]', chips).forEach((b) => (b.onclick = () => { sides.splice(Number(b.dataset.rs), 1); drawSides(); }));
+    $('[data-as]', chips).onclick = () => openSidePicker({ exclude: recipe && recipe.id, onPick: (x) => { sides.push(x); drawSides(); } });
+    $('#sidesField', sh.el).classList.toggle('hidden', $('[name=is_side]', sh.el).checked && !sides.length);
+  };
+  drawSides();
+  $('[name=is_side]', sh.el).onchange = drawSides;
   const foodsNoRest = () => S.foods.filter((f) => f.source !== 'restaurant');
 
   const rowFood = (row, p) => {
@@ -231,7 +248,8 @@ export function openRecipeEditor(recipe, { draft = false } = {}) {
       tags: String(fd.get('tags') || '').split(',').map((t) => t.trim()).filter(Boolean),
       steps: String(fd.get('steps') || '').split('\n').map((s) => s.trim()).filter(Boolean),
       description: fd.get('description'), image_url: fd.get('image_url'), source_url: fd.get('source_url'), notes: fd.get('notes'),
-      site_kcal: r.site_kcal ?? null, favorite: !!r.favorite,
+      site_kcal: r.site_kcal ?? null, favorite: !!r.favorite, is_side: !!fd.get('is_side'),
+      sides: sides.map((x) => ({ recipe_id: x.recipe_id, food_id: x.food_id, qty: x.qty, unit: x.unit })),
       ingredients: rows.filter((x) => x.text.trim()).map((x) => ({ text: x.text.trim(), food_id: x.food_id || null })),
     };
     try {

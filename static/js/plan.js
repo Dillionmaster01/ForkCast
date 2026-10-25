@@ -46,12 +46,29 @@ function mealMeta(it) {
   return bits.join(' · ');
 }
 
-function mealHtml(it) {
+function sideKcal(it) {
+  if (!it.perServing) return '';
+  if (filter !== 'all') {
+    const me = it.eaters.find((e) => e.user_id === filter);
+    return me ? `${fmtK(it.perServing.kcal * me.servings)} kcal` : '';
+  }
+  return `${fmtK(it.perServing.kcal)} kcal`;
+}
+
+function mealHtml(it, kids = []) {
   const eaters = it.eaters.map((e) => avatar(userById(e.user_id), e.status)).join('');
-  return `<div class="meal" draggable="true" data-id="${esc(it.id)}" style="--slot-color:var(--slot-${it.slot})">
+  return `<div class="meal-group"><div class="meal" draggable="true" data-id="${esc(it.id)}" style="--slot-color:var(--slot-${it.slot})">
     ${it.image_url ? `<img src="${esc(it.image_url)}" alt="" loading="lazy">` : ''}
     <div class="grow"><div class="t ellipsis">${esc(it.title)}</div><div class="m">${mealMeta(it)}</div></div>
-    <div class="eaters">${eaters}</div></div>`;
+    <div class="eaters">${eaters}</div></div>
+    ${kids.length ? `<div class="sides">${kids.map((k) => `<div class="side" data-side="${esc(k.id)}" style="--slot-color:var(--slot-${it.slot})" title="Side - tap to change">
+      <span class="ellipsis">+ ${esc(k.title)}</span><span class="k num">${sideKcal(k)}</span></div>`).join('')}</div>` : ''}</div>`;
+}
+
+// meals in a slot with their sides; a side whose main is hidden (person filter) shows on its own
+function groupSlot(list) {
+  const ids = new Set(list.map((i) => i.id));
+  return list.filter((i) => !i.parent_id || !ids.has(i.parent_id)).map((m) => mealHtml(m, list.filter((k) => k.parent_id === m.id))).join('');
 }
 
 function visible(it) {
@@ -126,10 +143,14 @@ export async function renderPlan(mount, mode, arg) {
   // meals and empty slots
   $$('.meal', cal).forEach((el) => {
     const it = data.items.find((x) => x.id === el.dataset.id);
-    el.onclick = () => openItemSheet(it, reload);
+    el.onclick = () => openItemSheet(it, reload, data.items.filter((x) => x.parent_id === it.id));
     el.addEventListener('dragstart', (e) => { e.dataTransfer.setData('text/plain', it.id); el.classList.add('dragging'); });
     el.addEventListener('dragend', () => el.classList.remove('dragging'));
   });
+  $$('[data-side]', cal).forEach((el) => (el.onclick = () => {
+    const it = data.items.find((x) => x.id === el.dataset.side);
+    openItemSheet(it, reload, [], data.items.find((x) => x.id === it.parent_id));
+  }));
   $$('[data-add]', cal).forEach((b) => (b.onclick = () => {
     const [date, slot] = b.dataset.add.split('|');
     openAddSheet({ date, slot, eaters: filter === 'all' ? S.users.map((u) => u.id) : [filter], onDone: reload });
@@ -176,7 +197,7 @@ function weekGrid(from, byDay, totals, today) {
       <div class="slots">${SLOTS.map((s) => {
         const list = items.filter((i) => i.slot === s.id);
         return `<div class="slot ${list.length ? '' : 'empty'}" data-slot="${s.id}" data-date="${d}"><div class="slot-name">${s.label}</div>
-          <div class="slot-items">${list.map(mealHtml).join('')}<button class="add-meal" data-add="${d}|${s.id}">+ Add</button></div></div>`;
+          <div class="slot-items">${groupSlot(list)}<button class="add-meal" data-add="${d}|${s.id}">+ Add</button></div></div>`;
       }).join('')}</div>
       ${(() => {
         const empty = SLOTS.filter((s) => !items.some((i) => i.slot === s.id));
@@ -192,7 +213,7 @@ function monthGrid(from, to, anchorDate, byDay, totals, today) {
   const head = [...Array(7)].map((_, i) => `<div class="dow">${dowName(addDays(from, i))}</div>`).join('');
   const order = Object.fromEntries(SLOTS.map((s, i) => [s.id, i]));
   return h(`<div class="month">${head}${cells.map((d) => {
-    const items = (byDay[d] || []).filter(visible).sort((a, b) => (a.slot === 'dinner' ? -1 : b.slot === 'dinner' ? 1 : order[a.slot] - order[b.slot]));
+    const items = (byDay[d] || []).filter((i) => visible(i) && !i.parent_id).sort((a, b) => (a.slot === 'dinner' ? -1 : b.slot === 'dinner' ? 1 : order[a.slot] - order[b.slot]));
     const pk = peopleShown().map((u) => {
       const t = totals[d]?.[u.id];
       if (!t) return '';
@@ -260,10 +281,10 @@ export function openAddSheet({ date, slot, eaters, mode = 'plan', recipeId = nul
       const term = q.value.trim().toLowerCase();
       if (tab === 'recipes') {
         let list = rlist.filter((r) => !term || r.name.toLowerCase().includes(term) || r.tags.some((t) => t.toLowerCase().includes(term)));
-        list = list.sort((a, b) => Number(b.favorite) - Number(a.favorite) || a.name.localeCompare(b.name));
+        list = list.sort((a, b) => Number(a.is_side) - Number(b.is_side) || Number(b.favorite) - Number(a.favorite) || a.name.localeCompare(b.name));
         res.innerHTML = list.length ? list.map((r) => `<div class="li click" data-id="${esc(r.id)}">
             ${r.image_url ? `<img class="thumb" src="${esc(r.image_url)}" alt="">` : `<span class="thumb">${recipeEmoji(r.name, r.tags)}</span>`}
-            <div class="grow"><div class="t">${r.favorite ? '★ ' : ''}${esc(r.name)}</div><div class="s">${fmtK(r.perServing.kcal)} kcal/serving · serves ${r.servings}${r.costPerServing != null ? ` · ${fmtMoney(r.costPerServing)}/serving` : ''}</div></div></div>`).join('')
+            <div class="grow"><div class="t">${r.favorite ? '★ ' : ''}${esc(r.name)}${r.is_side ? ' <span class="badge">side</span>' : ''}</div><div class="s">${fmtK(r.perServing.kcal)} kcal/serving · serves ${r.servings}${r.costPerServing != null ? ` · ${fmtMoney(r.costPerServing)}/serving` : ''}</div></div></div>`).join('')
           : `<div class="empty"><p>${rlist.length ? 'No recipe matches.' : 'No recipes yet.'}</p><a class="btn sm" href="#recipes">Add recipes</a></div>`;
         $$('.li', res).forEach((el) => (el.onclick = () => configStep({ kind: 'recipe', recipe: rlist.find((r) => r.id === el.dataset.id) })));
         return;
@@ -309,6 +330,7 @@ export function openAddSheet({ date, slot, eaters, mode = 'plan', recipeId = nul
       ${choice.kind === 'quick' ? `<div class="note" style="margin-bottom:12px"><b>${fmtK(choice.kcal)} kcal</b> per serving</div>` : ''}
       <div class="field"><span>Who's eating</span><div id="who"></div></div>
       <div class="field"><span>Status</span><div class="seg" id="st"><button type="button" data-s="planned" class="${eatenDefault ? '' : 'on'}">Planned</button><button type="button" data-s="eaten" class="${eatenDefault ? 'on' : ''}">Already eaten</button></div></div>
+      ${isRecipe && !choice.recipe.is_side ? '<div class="field"><span>Sides</span><div class="side-picks" id="sides"></div></div>' : ''}
       ${isRecipe ? `<div class="field"><span>How much to make (for the shopping list)</span><div class="row">${stepper(1, { min: 0, max: 10, step: 0.5, name: 'batch' })}<span class="muted small" id="bt"></span></div></div>` : ''}
       ${food && food.source !== 'restaurant' && !food.no_shop ? '<label class="row small"><input type="checkbox" id="noshop"> Already have it - leave it off the shopping list</label>' : ''}`;
     sh.setFoot(`<button class="btn" data-back>Back</button><button class="btn primary" data-addit>Add</button>`);
@@ -334,6 +356,18 @@ export function openAddSheet({ date, slot, eaters, mode = 'plan', recipeId = nul
     };
     sh.body.addEventListener('input', upd);
     upd();
+    // sides: the recipe's suggestions to tick, plus anything else
+    const sideList = isRecipe ? (choice.recipe.sides || []).map((x) => ({ ...x, on: false })) : [];
+    const sideBox = $('#sides', sh.body);
+    const drawSides = () => {
+      if (!sideBox) return;
+      sideBox.innerHTML = sideList.map((x, i) => `<button type="button" class="chip ${x.on ? 'on' : ''}" data-si="${i}">${x.on ? '✓' : '+'} ${esc(x.name)}${sideCal(x) ? ` <span class="${x.on ? '' : 'muted'} tiny num">${sideCal(x)}</span>` : ''}</button>`).join('')
+        + '<button type="button" class="chip" data-other>+ Other side</button>'
+        + (sideList.length ? '' : '<div class="tiny muted" style="flex-basis:100%">Tip: give the recipe suggested sides (Edit recipe) and they show up here.</div>');
+      $$('[data-si]', sideBox).forEach((b) => (b.onclick = () => { sideList[Number(b.dataset.si)].on = !sideList[Number(b.dataset.si)].on; drawSides(); }));
+      $('[data-other]', sideBox).onclick = () => openSidePicker({ onPick: (x) => { sideList.push({ ...x, on: true }); drawSides(); } });
+    };
+    drawSides();
     $('[data-back]', sh.el).onclick = () => { sh.setTitle(mode === 'log' ? 'What did you have?' : `Add to ${slotLabel(state.slot)}`); pickStep(); };
     $('[data-addit]', sh.el).onclick = async () => {
       const status = $('#st .on', sh.body).dataset.s;
@@ -341,7 +375,11 @@ export function openAddSheet({ date, slot, eaters, mode = 'plan', recipeId = nul
         .map((r) => ({ user_id: r.dataset.u, servings: Number($('[name=serv]', r).value) || 1, status }));
       if (!list.length) { toast('Pick who is eating.'); return; }
       const body = { date: state.date, slot: state.slot, kind: choice.kind, eaters: list };
-      if (isRecipe) { body.recipe_id = choice.recipe.id; body.batch = Number($('[name=batch]', sh.body).value); }
+      if (isRecipe) {
+        body.recipe_id = choice.recipe.id;
+        body.batch = Number($('[name=batch]', sh.body).value);
+        body.sides = sideList.filter((x) => x.on).map((x) => ({ kind: x.kind, recipe_id: x.recipe_id, food_id: x.food_id, qty: x.qty, unit: x.unit }));
+      }
       else if (food) {
         body.food_id = food.id; body.qty = Number($('#qty', sh.body).value) || 1; body.unit = $('#unit', sh.body).value;
         if ($('#noshop', sh.body)?.checked) body.batch = 0;
@@ -350,7 +388,8 @@ export function openAddSheet({ date, slot, eaters, mode = 'plan', recipeId = nul
         const r = await api('POST', '/api/plan', body);
         sh.close();
         if (afterAdd) await afterAdd(r.id);
-        toast(`Added ${name}${state.date !== date ? ` to ${fmtDay(state.date)}` : ''}.`);
+        const ns = body.sides ? body.sides.length : 0;
+        toast(`Added ${name}${ns ? ` with ${ns} side${ns === 1 ? '' : 's'}` : ''}${state.date !== date ? ` to ${fmtDay(state.date)}` : ''}.`);
         onDone && onDone();
       } catch (e) { fail(e); }
     };
@@ -366,7 +405,7 @@ export function openAddSheet({ date, slot, eaters, mode = 'plan', recipeId = nul
 }
 
 // ── one meal: who ate it, portions, move, cook ──────────────────────
-export function openItemSheet(it, onDone) {
+export function openItemSheet(it, onDone, kids = [], parent = null) {
   const sh = openSheet({ title: it.title });
   const changed = () => { onDone && onDone(); };
   const draw = () => {
@@ -376,6 +415,7 @@ export function openItemSheet(it, onDone) {
       <div class="row wrap small muted" style="margin-bottom:10px"><span class="badge" style="background:var(--slot-${it.slot});color:#fff">${slotLabel(it.slot)}</span>${fmtDay(it.date)}
         ${it.perServing ? `· <b class="num" style="color:var(--text)">${fmtK(it.perServing.kcal)} kcal</b>${isRecipe ? ' per serving' : ''}` : ''}
         ${it.brand ? `· ${esc(it.brand)}` : ''}</div>
+      ${parent ? `<div class="note" style="margin-bottom:12px">Side with <b>${esc(parent.title)}</b> - it moves and gets marked eaten along with it.</div>` : ''}
       <div class="field"><span>Who's eating it</span>
       ${it.eaters.map((e) => {
         const u = userById(e.user_id);
@@ -395,7 +435,10 @@ export function openItemSheet(it, onDone) {
       ${it.kind === 'food' ? `<div class="field"><span>Amount in one serving</span><div class="row"><input class="input" id="qty" type="number" min="0" step="any" value="${it.qty ?? 1}" style="max-width:110px">
         <select class="input" id="unit" style="max-width:170px">${unitsFor(S.foodsById[it.food_id]).map((u) => `<option value="${u}" ${u === it.unit ? 'selected' : ''}>${esc(unitName(u))}</option>`).join('')}</select></div></div>` : ''}
       ${it.kind === 'quick' ? `<div class="grid2"><label class="field"><span>Name</span><input class="input" id="qt" value="${esc(it.title)}"></label><label class="field"><span>Calories</span><input class="input" id="qk" type="number" min="0" value="${it.kcal ?? ''}"></label></div>` : ''}
-      <div class="field"><span>Move or copy to</span><div class="row wrap"><input class="input" type="date" id="md" value="${it.date}" style="max-width:170px">
+      ${it.parent_id ? '' : `<div class="field"><span>Sides</span><div>${kids.map((k) => `<div class="li" style="padding:6px 2px"><span class="grow">+ ${esc(k.title)}</span>
+          <span class="muted small num">${k.perServing ? `${fmtK(k.perServing.kcal)} kcal` : ''}</span><button class="btn ghost sm icon" data-rmside="${esc(k.id)}" title="Remove side">${icon('close')}</button></div>`).join('')}
+        <button class="btn sm" data-addside>${icon('plus')}Add a side</button></div></div>`}
+      <div class="field"><span>Move or copy to${kids.length ? ' (sides come along)' : ''}</span><div class="row wrap"><input class="input" type="date" id="md" value="${it.date}" style="max-width:170px">
         <select class="input" id="ms" style="max-width:150px">${SLOTS.map((s) => `<option value="${s.id}" ${s.id === it.slot ? 'selected' : ''}>${s.label}</option>`).join('')}</select>
         <button class="btn sm" data-move>Move</button><button class="btn sm" data-dup>${icon('copy')}Copy</button></div></div>`;
     sh.setFoot(`<button class="btn ghost danger" data-del>${icon('trash')}Remove</button><span class="spacer"></span><button class="btn primary" data-done>Done</button>`);
@@ -465,6 +508,22 @@ export function openItemSheet(it, onDone) {
       try { await api('DELETE', `/api/plan/${it.id}`); sh.close(); toast(`Removed ${it.title}.`); changed(); } catch (e) { fail(e); }
     };
     $('[data-done]', sh.el).onclick = () => sh.close();
+    $$('[data-rmside]', sh.body).forEach((b) => (b.onclick = async () => {
+      try { await api('DELETE', `/api/plan/${b.dataset.rmside}`); kids = kids.filter((k) => k.id !== b.dataset.rmside); changed(); draw(); } catch (e) { fail(e); }
+    }));
+    const as = $('[data-addside]', sh.body);
+    if (as) as.onclick = () => openSidePicker({
+      onPick: async (x) => {
+        try {
+          const r = await api('POST', '/api/plan', { kind: x.kind, recipe_id: x.recipe_id, food_id: x.food_id, qty: x.qty, unit: x.unit, parent_id: it.id,
+            eaters: it.eaters.map((e) => ({ user_id: e.user_id, servings: 1, status: e.status })) });
+          kids = [...kids, { id: r.id, title: x.name, perServing: x.kcal != null ? { kcal: x.kcal } : null }];
+          toast(`Added ${x.name}.`);
+          changed();
+          draw();
+        } catch (e) { fail(e); }
+      },
+    });
   }
 
   async function cook() {
@@ -479,4 +538,63 @@ export function openItemSheet(it, onDone) {
 
   draw();
   return sh;
+}
+
+// ── choosing a side ─────────────────────────────────────────────────
+function sideCal(x) {
+  if (x.kind === 'recipe') {
+    const r = (recipeCache || []).find((y) => y.id === x.recipe_id);
+    return r ? `${fmtK(r.perServing.kcal)} kcal` : '';
+  }
+  const f = S.foodsById[x.food_id];
+  const n = f ? nutritionFor(f, x.qty ?? 1, x.unit || defaultUnit(f)) : null;
+  return n ? `${fmtK(n.kcal)} kcal` : '';
+}
+
+// onPick gets { kind: 'recipe'|'food', recipe_id, food_id, qty, unit, name, kcal }
+export function openSidePicker({ onPick, exclude = null }) {
+  const sh = openSheet({ title: 'Add a side' });
+  let tab = 'recipes';
+  let all = false;
+  const draw = async () => {
+    sh.body.innerHTML = `<div class="tabs"><button data-t="recipes" class="${tab === 'recipes' ? 'on' : ''}">Side dishes</button><button data-t="foods" class="${tab === 'foods' ? 'on' : ''}">Foods</button></div>
+      <input class="input" id="sq" placeholder="${tab === 'recipes' ? 'Search recipes' : 'e.g. dinner roll, peas, fries'}" style="margin-bottom:8px"><div class="list" id="sr"></div>`;
+    $$('[data-t]', sh.body).forEach((b) => (b.onclick = () => { tab = b.dataset.t; draw(); }));
+    const q = $('#sq', sh.body);
+    const box = $('#sr', sh.body);
+    const list = tab === 'recipes' ? (recipeCache || (await recipes())) : null;
+    const render_ = () => {
+      const term = q.value.trim().toLowerCase();
+      if (tab === 'recipes') {
+        const pool = list.filter((r) => r.id !== exclude && (all || r.is_side || term) && (!term || r.name.toLowerCase().includes(term)));
+        box.innerHTML = (pool.length ? pool.map((r) => `<div class="li click" data-r="${esc(r.id)}"><span class="thumb">${recipeEmoji(r.name, r.tags)}</span>
+            <div class="grow"><div class="t">${esc(r.name)}${r.is_side ? '' : ' <span class="badge">main</span>'}</div><div class="s">${fmtK(r.perServing.kcal)} kcal/serving · serves ${r.servings}</div></div></div>`).join('')
+          : `<div class="muted small" style="padding:8px 4px">${list.some((r) => r.is_side) ? 'No side dish matches.' : 'No side dishes yet - mark a recipe as a side dish when you edit it, or pick a food.'}</div>`)
+          + (all || term ? '' : '<button class="link small" data-all style="margin-top:8px">Show all recipes</button>');
+        $$('[data-r]', box).forEach((el) => (el.onclick = () => {
+          const r = list.find((x) => x.id === el.dataset.r);
+          sh.close();
+          onPick({ kind: 'recipe', recipe_id: r.id, food_id: null, qty: null, unit: null, name: r.name, kcal: r.perServing.kcal });
+        }));
+        const a = $('[data-all]', box);
+        if (a) a.onclick = () => { all = true; render_(); };
+        return;
+      }
+      const pool = S.foods.filter((f) => !f.archived);
+      const found = term ? searchFoods(term, pool, 30) : pool.filter((f) => f.source === 'custom').slice(-10).reverse();
+      box.innerHTML = found.length ? found.map((f) => `<div class="li click" data-f="${esc(f.id)}"><div class="grow"><div class="t">${esc(f.name)}</div><div class="s">${foodLine(f)}</div></div></div>`).join('')
+        : `<div class="muted small" style="padding:8px 4px">${term ? 'Nothing matches.' : 'Type to search foods.'}</div>`;
+      $$('[data-f]', box).forEach((el) => (el.onclick = () => {
+        const f = S.foodsById[el.dataset.f];
+        const unit = defaultUnit(f);
+        const n = nutritionFor(f, 1, unit);
+        sh.close();
+        onPick({ kind: 'food', recipe_id: null, food_id: f.id, qty: 1, unit, name: f.name, kcal: n ? Math.round(n.kcal) : null });
+      }));
+    };
+    q.oninput = render_;
+    render_();
+    setTimeout(() => q.focus(), 60);
+  };
+  draw();
 }

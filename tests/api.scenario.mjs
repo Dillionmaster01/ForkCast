@@ -274,16 +274,73 @@ async function step4() {
     check(r.data.results[0].kcal > 300, `USDA search works (${r.data.results[0].name}, ${r.data.results[0].kcal} kcal/100 g)`);
     const pick = r.data.results.find((x) => !x.brand) || r.data.results[0];
     r = await api('POST', '/api/foods/remote-import', { source: 'usda', ref: pick.ref }, S.d);
-    check(r.status === 200 && r.data.source === 'usda', `USDA food imported with units ${JSON.stringify(r.data.units)}`);
-    const again = await api('POST', '/api/foods/remote-import', { source: 'usda', ref: pick.ref }, S.d);
-    check(again.data.id === r.data.id, 'importing the same food twice reuses it');
+    if (r.status === 200) {
+      check(r.data.source === 'usda', `USDA food imported with units ${JSON.stringify(r.data.units)}`);
+      const again = await api('POST', '/api/foods/remote-import', { source: 'usda', ref: pick.ref }, S.d);
+      check(again.data.id === r.data.id, 'importing the same food twice reuses it');
+    } else console.log(`  · USDA details unavailable (${r.status} ${r.data?.detail}) - DEMO_KEY is rate limited`);
   } else console.log(`  · USDA lookup unavailable (${r.status} ${r.data?.detail}) - DEMO_KEY is rate limited`);
   r = await api('GET', '/api/foods/barcode/0049000028911', undefined, S.d); // a Coca-Cola can
   if (r.status === 200) check(r.data.food.kcal >= 0 && r.data.food.source === 'off', `barcode lookup works (${r.data.food.name})`);
   else console.log(`  · barcode lookup unavailable (${r.status} ${r.data?.detail})`);
 }
 
-const steps = { 1: step1, 2: step2, 3: step3, 4: step4 };
+async function step5() {
+  console.log('Step 5 · sides');
+  const f = (n) => S.foods.find((x) => x.name === n);
+  let r = await api('POST', '/api/recipes', { name: 'Mashed Potatoes', servings: 4, is_side: true, ingredients: ['2 lbs potatoes', '4 tbsp butter', '1/2 cup milk', 'salt to taste'] }, S.d);
+  const mash = r.data;
+  check(mash.is_side === true, 'a recipe can be a side dish');
+  r = await api('POST', '/api/recipes', { name: 'Pork Chops', servings: 2, ingredients: ['2 pork chops', '1 tbsp olive oil'],
+    sides: [{ recipe_id: mash.id }, { food_id: f('Green beans').id, qty: 1, unit: 'cup' }, { food_id: 'nope' }] }, S.d);
+  const chops = r.data;
+  check(chops.sides.length === 2 && chops.sides[0].name === 'Mashed Potatoes' && chops.sides[1].kcal > 0, `main recipe suggests 2 sides (${chops.sides.map((x) => x.name).join(', ')})`);
+  r = await api('PUT', `/api/recipes/${chops.id}`, { favorite: true }, S.d);
+  check(r.data.sides.length === 2, 'favorite toggle keeps the sides');
+  r = await api('GET', '/api/recipes', undefined, S.d);
+  const listed = r.data.find((x) => x.id === chops.id);
+  check(listed.sides.length === 2 && r.data.find((x) => x.id === mash.id).is_side, 'recipe list includes sides and side flag');
+
+  const day = D(40);
+  r = await api('POST', '/api/plan', { date: day, slot: 'dinner', kind: 'recipe', recipe_id: chops.id, eaters: [{ user_id: S.dId }, { user_id: S.jId }],
+    sides: [{ kind: 'recipe', recipe_id: mash.id }, { kind: 'food', food_id: f('Green beans').id, qty: 1, unit: 'cup' }] }, S.d);
+  check(r.status === 200 && r.data.sides.length === 2, 'meal planned with 2 sides');
+  const mainId = r.data.id;
+  r = await api('GET', `/api/plan?from=${day}&to=${day}`, undefined, S.d);
+  const sides = r.data.items.filter((i) => i.parent_id === mainId);
+  check(sides.length === 2 && sides.every((x) => x.eaters.length === 2), 'sides hang off the main with the same people');
+  const before = r.data.totals[day][S.dId].planned.kcal;
+  const mainK = r.data.items.find((i) => i.id === mainId).perServing.kcal;
+  check(before > mainK + 100, `sides count in the calories (${before} vs main ${mainK})`);
+
+  r = await api('PUT', `/api/plan/${mainId}/eaters/${S.dId}`, { status: 'eaten' }, S.d);
+  r = await api('GET', `/api/plan?from=${day}&to=${day}`, undefined, S.d);
+  check(r.data.items.filter((i) => i.parent_id === mainId).every((x) => x.eaters.find((e) => e.user_id === S.dId).status === 'eaten')
+    && r.data.items.filter((i) => i.parent_id === mainId).every((x) => x.eaters.find((e) => e.user_id === S.jId).status === 'planned'), 'eating the main marks its sides eaten for that person only');
+
+  r = await api('POST', '/api/shopping/preview', { from: day, to: day }, S.d);
+  const names = r.data.lines.map((l) => l.name);
+  check(names.includes('Potato') && names.includes('Green beans') && names.includes('Pork chops'), 'sides go on the shopping list');
+
+  r = await api('POST', '/api/plan', { kind: 'food', food_id: f('Hamburger buns').id, parent_id: mainId, eaters: [{ user_id: S.dId }] }, S.d);
+  check(r.status === 200, 'add a side to a meal later');
+  await api('PUT', `/api/plan/${mainId}`, { date: D(41), slot: 'lunch' }, S.d);
+  r = await api('GET', `/api/plan?from=${D(41)}&to=${D(41)}`, undefined, S.d);
+  check(r.data.items.length === 4 && r.data.items.every((i) => i.slot === 'lunch'), 'moving the main moves its sides');
+  await api('POST', `/api/plan/${mainId}/duplicate`, { date: D(42), slot: 'dinner' }, S.d);
+  r = await api('GET', `/api/plan?from=${D(42)}&to=${D(42)}`, undefined, S.d);
+  const newMain = r.data.items.find((i) => !i.parent_id);
+  check(r.data.items.length === 4 && r.data.items.filter((i) => i.parent_id === newMain.id).length === 3, 'copying a meal copies its sides');
+  await api('POST', '/api/plan/copy', { from: D(41), to: D(42), target: D(48) }, S.d);
+  r = await api('GET', `/api/plan?from=${D(48)}&to=${D(49)}`, undefined, S.d);
+  const mains = r.data.items.filter((i) => !i.parent_id);
+  check(mains.length === 2 && r.data.items.filter((i) => i.parent_id).every((i) => mains.some((m) => m.id === i.parent_id)), 'copying days keeps each side with its copied main');
+  await api('DELETE', `/api/plan/${mainId}`, undefined, S.d);
+  r = await api('GET', `/api/plan?from=${D(41)}&to=${D(41)}`, undefined, S.d);
+  check(r.data.items.length === 0, 'removing the main removes its sides');
+}
+
+const steps = { 1: step1, 2: step2, 3: step3, 4: step4, 5: step5 };
 for (const [n, fn] of Object.entries(steps)) {
   if (only.length && !only.includes(Number(n))) continue;
   try { await fn(); } catch (e) { fail++; console.log(`  ✖ step ${n} crashed: ${e.stack}`); break; }
