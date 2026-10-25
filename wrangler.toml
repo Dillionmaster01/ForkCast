@@ -13,5 +13,5 @@ directory = "./static"
 [[d1_databases]]
 binding = "DB"
 database_name = "forkcast-db"
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "37f7f3a5-d943-443e-89d5-5c32f9d462e4"
 migrations_dir = "migrations"
